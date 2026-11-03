@@ -82,39 +82,50 @@ function parseQ(txt) {
   return a.map(fix).filter(okq);
 }
 
+const hasAI = env => !!(env.GEMINI_API_KEY || env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.XAI_API_KEY || (env.CUSTOM_AI_KEY && env.CUSTOM_AI_URL));
+// একাধিক এআই: একটি ব্যস্ত/ব্যর্থ হলে পরেরটি। ক্রম: AI_ORDER (ডিফল্ট gemini,anthropic,openai,xai,custom); শুধু যেগুলোর কী সেট আছে সেগুলো চলে।
 async function ai(env, p, pdf) {
-  // ক্রম: Gemini মডেলগুলো (GEMINI_MODELS কমা দিয়ে লিখলে সেটাই) → তারপর ঐচ্ছিক Claude (ANTHROPIC_API_KEY থাকলে)
-  const gm = (env.GEMINI_MODELS || env.GEMINI_MODEL || "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash").split(",").map(s => s.trim()).filter(Boolean);
-  let txt = "", lastErr = "";
-  if (env.GEMINI_API_KEY) {
-    outer: for (const model of gm) {
-      for (let k = 0; k < 2; k++) {
-        const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-          body: JSON.stringify({ contents: [{ parts: (pdf ? [{ inline_data: { mime_type: "application/pdf", data: pdf } }] : []).concat([{ text: p }]) }], generationConfig: { responseMimeType: "application/json", temperature: 0.8 } })
-        });
-        const j = await r.json().catch(() => ({}));
-        if (r.ok && j.candidates && j.candidates[0] && j.candidates[0].content) { txt = j.candidates[0].content.parts.map(x => x.text || "").join(""); break outer; }
-        lastErr = model + ": " + ((j.error && j.error.message) || r.status);
-        if (r.status === 429 || r.status >= 500) await new Promise(res => setTimeout(res, 1500)); else break;
+  const errs = [], t0 = Date.now(), wait = ms => new Promise(r => setTimeout(r, ms));
+  const csv = (v, d) => String(v || d || "").split(",").map(s => s.trim()).filter(Boolean);
+  const oai = (url, key) => async model => {
+    const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + key }, body: JSON.stringify({ model, temperature: 0.7, messages: [{ role: "user", content: pdf ? [{ type: "file", file: { filename: "q.pdf", file_data: "data:application/pdf;base64," + pdf } }, { type: "text", text: p }] : p }] }) });
+    const j = await r.json().catch(() => ({})), m = j.choices && j.choices[0] && j.choices[0].message;
+    return { st: r.status, txt: m && m.content, msg: (j.error && (j.error.message || j.error)) || "" };
+  };
+  const P = {
+    gemini: env.GEMINI_API_KEY && { name: "Gemini", models: csv(env.GEMINI_MODELS || env.GEMINI_MODEL, "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash"), call: async model => {
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", { method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+        body: JSON.stringify({ contents: [{ parts: (pdf ? [{ inline_data: { mime_type: "application/pdf", data: pdf } }] : []).concat([{ text: p }]) }], generationConfig: { responseMimeType: "application/json", temperature: 0.8 } }) });
+      const j = await r.json().catch(() => ({})), c = j.candidates && j.candidates[0] && j.candidates[0].content;
+      return { st: r.status, txt: c && c.parts && c.parts.map(x => x.text || "").join(""), msg: (j.error && j.error.message) || (j.promptFeedback && j.promptFeedback.blockReason) || "ফাঁকা উত্তর" };
+    } },
+    anthropic: env.ANTHROPIC_API_KEY && { name: "Claude", models: csv(env.ANTHROPIC_MODELS, "claude-sonnet-5-5,claude-haiku-5-5"), call: async model => {
+      const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model, max_tokens: 8000, messages: [{ role: "user", content: pdf ? [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: pdf } }, { type: "text", text: p }] : p }] }) });
+      const j = await r.json().catch(() => ({}));
+      return { st: r.status, txt: j.content && j.content.map(x => x.text || "").join(""), msg: (j.error && j.error.message) || "" };
+    } },
+    openai: env.OPENAI_API_KEY && { name: "ChatGPT", models: csv(env.OPENAI_MODELS, "gpt-4.1-mini,gpt-4o-mini"), call: oai("https://api.openai.com/v1/chat/completions", env.OPENAI_API_KEY) },
+    xai: env.XAI_API_KEY && { name: "Grok", nopdf: 1, models: csv(env.XAI_MODELS, "grok-3-mini,grok-3"), call: oai("https://api.x.ai/v1/chat/completions", env.XAI_API_KEY) },
+    custom: env.CUSTOM_AI_KEY && env.CUSTOM_AI_URL && { name: "Custom", nopdf: 1, models: csv(env.CUSTOM_AI_MODELS), call: oai(env.CUSTOM_AI_URL, env.CUSTOM_AI_KEY) }
+  };
+  const order = csv(env.AI_ORDER, "gemini,anthropic,openai,xai,custom").map(s => s.toLowerCase()).filter(k => P[k]);
+  if (!order.length) throw new Error("কোনো এআই এপিআই কী সেট করা নেই (GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY)");
+  for (const k of order) {
+    const pr = P[k];
+    if (pdf && pr.nopdf) { errs.push(pr.name + ": PDF সমর্থন নেই"); continue; }
+    for (const model of pr.models) {
+      for (let n = 0; n < 2; n++) {
+        if (Date.now() - t0 > 50000) { errs.push("সময় শেষ"); throw new Error("এআই এখন ব্যস্ত — " + errs.slice(-5).join(" | ")); }
+        let res;
+        try { res = await pr.call(model); } catch (e) { res = { st: 0, txt: "", msg: String(e.message || e) }; }
+        if (res.txt) { env.__via = pr.name + " (" + model + ")"; return res.txt; }
+        errs.push(pr.name + ":" + model + " " + res.st + " " + String(res.msg).slice(0, 70));
+        if (res.st === 429 || res.st >= 500 || res.st === 0) await wait(1500); else break;
       }
     }
   }
-  if (!txt && env.ANTHROPIC_API_KEY) {
-    for (const model of (env.ANTHROPIC_MODELS || "claude-sonnet-5-5,claude-haiku-5-5").split(",").map(s => s.trim()).filter(Boolean)) {
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model, max_tokens: 8000, messages: [{ role: "user", content: pdf ? [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: pdf } }, { type: "text", text: p }] : p }] })
-      });
-      const j = await r.json().catch(() => ({}));
-      if (r.ok && j.content) { txt = j.content.map(x => x.text || "").join(""); break; }
-      lastErr = model + ": " + ((j.error && j.error.message) || r.status);
-    }
-  }
-  if (!txt) throw new Error("এআই এখন ব্যস্ত, একটু পরে আবার চেষ্টা করুন। (" + (lastErr || "কোনো এপিআই কী সেট নেই") + ")");
-  return txt;
+  throw new Error("সব এআই ব্যর্থ — " + errs.slice(-5).join(" | "));
 }
 
 const HINT = {
@@ -365,15 +376,16 @@ async function admApi(env, p, B, Q, now) {
     return J({ ok: 1 });
   }
   if (p === "/api/admin/generate") {
-    if (!env.GEMINI_API_KEY && !env.ANTHROPIC_API_KEY) return J({ error: "GEMINI_API_KEY সেট করা নেই" }, 400);
-    return J({ qs: await gen(env, B) });
+    if (!hasAI(env)) return J({ error: "কোনো এআই এপিআই কী সেট করা নেই" }, 400);
+    const qs = await gen(env, B);
+    return J({ qs, via: env.__via });
   }
   if (p === "/api/admin/extract") {
     if (!B.pdf) return J({ error: "PDF নেই" }, 400);
     const f = +B.from || 1, t2 = +B.to || f + 19, sl = Array.isArray(B.subjects) ? B.subjects : [];
-    const pr = "এই PDF-এ বিগত চাকরি/ভর্তি পরীক্ষার MCQ প্রশ্ন আছে। প্রশ্ন নং " + f + " থেকে " + t2 + " পর্যন্ত প্রশ্নগুলো বের করো। নিয়ম: ১) প্রশ্ন ও অপশন PDF-এ যেমন আছে হুবহু (বাংলা/ইংরেজি) রাখো, নিজে বদলাবে না। ২) ঠিক ৪টি অপশন না থাকলে বা পড়া না গেলে সেই প্রশ্ন বাদ দাও। ৩) সঠিক উত্তর PDF-এর উত্তরমালা/চিহ্ন থেকে নাও; না থাকলে নিজে সমাধান করে সবচেয়ে সঠিকটা দাও। ৪) c = \"high\" যদি উত্তর PDF-এ ছিল বা তুমি ১০০% নিশ্চিত, নইলে \"low\"। ৫) s = এই তালিকার সবচেয়ে মানানসই বিষয় (হুবহু): " + sl.join(", ") + "। ৬) e = ১ বাক্যে বাংলায় ব্যাখ্যা। ৭) t = ছোট টপিকের নাম। এই নম্বর সীমায় প্রশ্ন না থাকলে খালি অ্যারে দাও। আউটপুট শুধু JSON অ্যারে: [{\"q\":\"\",\"o\":[\"\",\"\",\"\",\"\"],\"a\":0,\"c\":\"high\",\"s\":\"\",\"t\":\"\",\"e\":\"\"}] — a হলো সঠিক অপশনের ইনডেক্স (০-৩)।";
+    const pr = "এই PDF-এ বিগত চাকরি/ভর্তি পরীক্ষার MCQ প্রশ্ন আছে (লেখা বা স্ক্যান করা ছবি—দুটোই পড়ো, বাংলা ও ইংরেজি দুই ভাষাতেই)। PDF-এর প্রশ্নগুলো শুরু থেকে ক্রমানুসারে গুনে " + f + "-তম থেকে " + t2 + "-তম পর্যন্ত প্রশ্নগুলো বের করো (প্রশ্নে যে নম্বরই লেখা থাকুক, ক্রমানুসারে গণনা করো)। নিয়ম: ১) প্রশ্ন ও অপশন PDF-এ যেমন আছে হুবহু রাখো, নিজে বদলাবে না। ২) ঠিক ৪টি অপশন না থাকলে বা পড়া না গেলে সেই প্রশ্ন বাদ দাও। ৩) সঠিক উত্তর PDF-এর উত্তরমালা/চিহ্ন থেকে নাও; না থাকলে নিজে সমাধান করে সবচেয়ে সঠিকটা দাও। ৪) c = \"high\" যদি উত্তর PDF-এ ছিল বা তুমি ১০০% নিশ্চিত, নইলে \"low\"। ৫) s = এই তালিকার সবচেয়ে মানানসই বিষয় (হুবহু): " + sl.join(", ") + "। ৬) e = ১ বাক্যে বাংলায় ব্যাখ্যা। ৭) t = ছোট টপিকের নাম। PDF-এ এই ক্রমের প্রশ্ন না থাকলে খালি অ্যারে [] দাও। আউটপুট শুধু JSON অ্যারে: [{\"q\":\"\",\"o\":[\"\",\"\",\"\",\"\"],\"a\":0,\"c\":\"high\",\"s\":\"\",\"t\":\"\",\"e\":\"\"}] — a হলো সঠিক অপশনের ইনডেক্স (০-৩).";
     const txt = await ai(env, pr, B.pdf);
-    return J({ qs: parseQ(txt).map(x => ({ q: x.q, o: x.o, a: x.a, e: x.e || "", t: x.t || "", c: x.c === "high" ? "" : "low", s: sl.indexOf(x.s) > -1 ? x.s : "", src: B.src || "" })) });
+    return J({ qs: parseQ(txt).map(x => ({ q: x.q, o: x.o, a: x.a, e: x.e || "", t: x.t || "", c: x.c === "high" ? "" : "low", s: sl.indexOf(x.s) > -1 ? x.s : "", src: B.src || "" })), via: env.__via });
   }
   if (p === "/api/admin/test/create") {
     const subs = Array.isArray(B.subjects) ? B.subjects : [], n = Math.max(1, Math.min(300, +B.n || 30)), w = [], a = [];
@@ -510,8 +522,8 @@ table.t{width:100%;border-collapse:collapse;font-size:.85rem}table.t td,table.t 
 <script>
 var SITE=__SITE__;document.title=SITE.name+" – সরকারি চাকরির প্রস্তুতি";
 var $=function(i){return document.getElementById(i)},V=$("v");
-var BODIES=["বিসিএস/বিপিএসসি","নন-ক্যাডার","উপ-সহকারী প্রকৌশলী","বুয়েট প্যাটার্ন","MIST প্যাটার্ন","ঢাকা পলিটেকনিক","ব্যাংক","শিক্ষক নিয়োগ","বিশ্ববিদ্যালয় ভর্তি","অন্যান্য"];
-var GRADES=["৯ম গ্রেড ","১০ম গ্রেড","১১–১২তম গ্রেড","১৩–১৬তম গ্রেড","১৭–২০তম গ্রেড"];
+var BODIES=["বিসিএস/বিপিএসসি","নন-ক্যাডার","বুয়েট প্যাটার্ন","MIST প্যাটার্ন","ঢাকা পলিটেকনিক","ব্যাংক","শিক্ষক নিয়োগ","বিশ্ববিদ্যালয় ভর্তি","অন্যান্য"];
+var GRADES=["৯ম–১০ম গ্রেড","১১শ–১২শ গ্রেড","১৩শ–১৬শ গ্রেড","১৭শ–২০তম গ্রেড"];
 var TRACKS=["টেকনিক্যাল","নন-টেকনিক্যাল"];
 var SUBJ=["বাংলা","ইংরেজি","গণিত","সাধারণ জ্ঞান (বাংলাদেশ)","সাধারণ জ্ঞান (আন্তর্জাতিক)","সাধারণ বিজ্ঞান","মানসিক দক্ষতা","কম্পিউটার ও আইসিটি","ইলেকট্রিক্যাল","সিভিল","মেকানিক্যাল","পদার্থবিজ্ঞান","রসায়ন","জীববিজ্ঞান","উচ্চতর গণিত"];
 var STY=["বিসিএস প্রিলিমিনারি","বিপিএসসি নন-ক্যাডার","উপসহকারী প্রকৌশলী (ডিপ্লোমা ইঞ্জিনিয়ারিং, PDB/LGED/PWD)","বুয়েট/MIST ভর্তি প্যাটার্ন","বিশ্ববিদ্যালয় ভর্তি পরীক্ষা (ঢাবি/জাবি/রাবি/চবি/গুচ্ছ)","ব্যাংক ও অন্যান্য সরকারি চাকরি","শিক্ষক নিয়োগ (এনটিআরসিএ/প্রাথমিক)"];
@@ -527,7 +539,7 @@ function uid(){var u=ls("uid");if(!u){u=(crypto.randomUUID?crypto.randomUUID():S
 var IC={book:'<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',alert:'<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',layers:'<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',zap:'<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',award:'<circle cx="12" cy="8" r="6"/><path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11"/>',crown:'<path d="M2 18h20M3 7l5 5 4-7 4 7 5-5-2 11H5z"/>',user:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',out:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',dl:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',search:'<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',ok:'<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',lock:'<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',flame:'<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',cal:'<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',play:'<circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/>',x:'<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',star:'<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',target:'<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',chev:'<polyline points="6 9 12 15 18 9"/>'};
 function ic(n,s){return'<svg class="ic" viewBox="0 0 24 24" width="'+(s||20)+'" height="'+(s||20)+'" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+IC[n]+'</svg>'}
 function logo(){return'<span class="logo">'+ic("ok",22)+'</span>'}
-async function api(p,b,adm){var h={"content-type":"application/json"};if(S.t)h.authorization="Bearer "+S.t;if(adm)h["x-admin"]=sessionStorage.getItem("ap")||"";var r=await fetch(p,{method:b?"POST":"GET",headers:h,body:b?JSON.stringify(b):undefined});var d=await r.json().catch(function(){return{}});if(!r.ok){d.status=r.status;throw d}return d}
+async function api(p,b,adm){var h={"content-type":"application/json"};if(S.t)h.authorization="Bearer "+S.t;if(adm)h["x-admin"]=sessionStorage.getItem("ap")||"";var r=await fetch(p,{method:b?"POST":"GET",headers:h,body:b?JSON.stringify(b):undefined});var d=await r.json().catch(function(){return{}});if(!r.ok){d.status=r.status;if(!d.error)d.error="সার্ভার ত্রুটি ("+r.status+")"+(adm?" — ফাইল বড় হলে সার্ভারের সীমা পেরিয়ে থাকতে পারে":"");throw d}return d}
 function opts(list,sel,first){return'<option value="">'+(first||"বাছাই করুন")+'</option>'+list.map(function(x){return'<option'+(x==sel?' selected':'')+'>'+esc(x)+'</option>'}).join("")}
 function modal(h){closeM();var m=document.createElement("div");m.className="mdl";m.id="mdl";m.innerHTML='<div class="mb">'+h+'</div>';m.addEventListener("click",function(e){if(e.target==m)closeM()});document.body.appendChild(m)}
 function closeM(){var m=$("mdl");if(m)m.remove()}
@@ -635,28 +647,28 @@ a.innerHTML='<div class="row">'+c("মোট ইউজার",s.users,"আজ �
 /* প্রশ্নভান্ডার */
 function adQB(){var chk=function(id,l){return'<div class="chips" id="'+id+'" style="flex-wrap:wrap;overflow:visible">'+l.map(function(s){return'<label style="border:1.5px solid var(--b);border-radius:12px;padding:5px 12px;display:flex;gap:6px;align-items:center;color:var(--t);background:var(--c)"><input type="checkbox" value="'+esc(s)+'" style="width:auto;margin:0">'+esc(s)+'</label>'}).join("")+'</div>'};
 $("ad").innerHTML='<div class="card"><h2>১) ট্যাগ (এই ব্যাচের সব প্রশ্নে বসবে)</h2><div class="row"><div><label>পরীক্ষার ধরন</label><select id="tg_b">'+opts(BODIES)+'</select></div><div><label>গ্রেড</label><select id="tg_g">'+opts(GRADES)+'</select></div><div><label>ধরন</label><select id="tg_t">'+opts(TRACKS)+'</select></div></div><label>সূত্র লেবেল (ঐচ্ছিক, যেমন: ৪৫তম বিসিএস)</label><input id="tg_s"><label style="display:flex;gap:8px;align-items:center;color:var(--t)"><input type="checkbox" id="tg_f" style="width:auto;margin:0"> এই ব্যাচের প্রশ্নগুলো ফ্রি (সবার জন্য খোলা) থাকবে</label></div>'+
-'<div class="card"><h2>২) এআই দিয়ে প্রশ্ন তৈরি</h2><label>বিষয় (এক বা একাধিক)</label>'+chk("gs",SUBJ)+'<div class="row"><div><label>পরীক্ষার ধাঁচ</label><select id="gy">'+STY.map(function(s){return'<option>'+esc(s)+'</option>'}).join("")+'</select></div><div><label>কাঠিন্য</label><select id="gd"><option>মাঝারি</option><option selected>কঠিন</option><option>খুবই কঠিন (ক্রিটিক্যাল)</option></select></div><div><label>মোট প্রশ্ন</label><input id="gn" type="number" value="30"></div></div><label>ঐচ্ছিক: বিগত বছরের আসল কিছু প্রশ্ন (এআই এই ধাঁচে বানাবে)</label><textarea id="gr" rows="3"></textarea><button class="btn wide" id="gb" onclick="genq()">প্রশ্ন তৈরি করুন</button></div>'+
-'<div class="card"><h2>৩) PDF থেকে বিগত প্রশ্ন সংগ্রহ</h2><div class="m">একটি পরীক্ষার (যেমন ৪৫তম বিসিএস) একটি PDF দিন (১০ MB-এর মধ্যে)। উত্তরমালা না থাকলে এআই নিজে সমাধান করে ⚠ চিহ্ন দেবে, আপনি যাচাই করবেন।</div><input id="pf" type="file" accept="application/pdf"><div class="row"><div><label>প্রশ্ন নং থেকে</label><input id="pa" type="number" value="1"></div><div><label>পর্যন্ত</label><input id="pz" type="number" value="200"></div></div><button class="btn wide" id="pb2" onclick="ext()">প্রশ্ন বের করুন</button></div>'+
+'<div class="card"><h2>২) এআই দিয়ে প্রশ্ন তৈরি</h2><label>বিষয় (এক বা একাধিক)</label>'+chk("gs",SUBJ)+'<div class="row"><div><label>পরীক্ষার ধাঁচ</label><select id="gy">'+STY.map(function(s){return'<option>'+esc(s)+'</option>'}).join("")+'</select></div><div><label>কাঠিন্য</label><select id="gd"><option>মাঝারি</option><option selected>কঠিন</option><option>খুবই কঠিন (ক্রিটিক্যাল)</option></select></div><div><label>মোট প্রশ্ন</label><input id="gn" type="number" value="30"></div></div><label>ঐচ্ছিক: বিগত বছরের আসল কিছু প্রশ্ন (এআই এই ধাঁচে বানাবে)</label><textarea id="gr" rows="3"></textarea><button class="btn wide" id="gb" onclick="genq()">প্রশ্ন তৈরি করুন</button><div class="m" id="gxr" style="margin-top:8px"></div></div>'+
+'<div class="card"><h2>৩) PDF থেকে বিগত প্রশ্ন সংগ্রহ</h2><div class="m">একটি পরীক্ষার (যেমন ৪৫তম বিসিএস) একটি PDF দিন (১০ MB-এর মধ্যে)। উত্তরমালা না থাকলে এআই নিজে সমাধান করে ⚠ চিহ্ন দেবে, আপনি যাচাই করবেন।</div><input id="pf" type="file" accept="application/pdf"><div class="row"><div><label>প্রশ্ন নং থেকে</label><input id="pa" type="number" value="1"></div><div><label>পর্যন্ত</label><input id="pz" type="number" value="200"></div></div><button class="btn wide" id="pb2" onclick="ext()">প্রশ্ন বের করুন</button><div class="m" id="exr" style="margin-top:8px"></div></div>'+
 '<div class="card"><h2>৪) JSON ইমপোর্ট / হাতে যোগ</h2><textarea id="ij" rows="3" placeholder=\'[{"s":"বাংলা","t":"সন্ধি","q":"প্রশ্ন","o":["ক","খ","গ","ঘ"],"a":0,"e":"ব্যাখ্যা"}]\'></textarea><button class="btn g wide" onclick="impq()">JSON ইমপোর্ট</button><hr style="border:0;border-top:1px solid var(--b);margin:14px 0"><div class="row"><div><label>বিষয়</label><select id="mq_s">'+opts(SUBJ)+'</select></div><div><label>টপিক</label><input id="mq_t"></div></div><label>প্রশ্ন</label><textarea id="mq_q" rows="2"></textarea><input id="mq_0" placeholder="(ক)"><input id="mq_1" placeholder="(খ)"><input id="mq_2" placeholder="(গ)"><input id="mq_3" placeholder="(ঘ)"><div class="row"><div><select id="mq_a"><option value="0">সঠিক: ক</option><option value="1">সঠিক: খ</option><option value="2">সঠিক: গ</option><option value="3">সঠিক: ঘ</option></select></div><div><input id="mq_e" placeholder="ছোট ব্যাখ্যা"></div></div><button class="btn g wide" onclick="manq()">খসড়ায় যোগ করুন</button></div><div id="dr"></div><div id="qb"></div>';drf();qbInfo()}
 function tags(){return{body:$("tg_b").value,grade:$("tg_g").value,track:$("tg_t").value,src:$("tg_s").value,free:$("tg_f").checked}}
 function drf(){var d=$("dr");if(!d)return;d.innerHTML='<div class="card"><h2>খসড়া ('+bn(D.length)+'টি প্রশ্ন)</h2><div class="m">সবুজ = সঠিক উত্তর। ভুল মনে হলে সঠিক অপশনে চাপ দিয়ে বদলান, বা ✕ দিয়ে বাদ দিন।</div></div>'+D.map(function(q,i){return'<div class="card q"><div class="m">'+esc(q.s||"বিষয় নেই")+(q.t?' · '+esc(q.t):'')+(q.src?' · '+esc(q.src):'')+'</div><div class="qt">'+(i+1)+'. '+esc(q.q)+'</div>'+q.o.map(function(o,j){return'<div class="op'+(j==q.a?' ok':'')+'" style="cursor:pointer" onclick="D['+i+'].a='+j+';D['+i+'].c=\'\';drf()"><i>('+"কখগঘ"[j]+')</i><span>'+esc(o)+'</span></div>'}).join("")+(q.c=="low"?'<div class="m" style="color:var(--no)">⚠ উত্তর যাচাই করুন (এআই নিশ্চিত নয়)</div>':'')+'<div class="m">💡 '+esc(q.e||"")+'</div>'+(q.s?'':'<select onchange="D['+i+'].s=this.value">'+opts(SUBJ)+'</select>')+'<button class="btn g sm" onclick="D.splice('+i+',1);drf()">✕ বাদ দিন</button></div>'}).join("")+(D.length?'<button class="btn wide" onclick="saveQ()">📚 ভান্ডারে সংরক্ষণ</button><br>':'')}
 async function saveQ(){var miss=D.filter(function(q){return!q.s}).length;if(miss){toast("কিছু প্রশ্নে বিষয় বাছাই করা হয়নি ("+bn(miss)+"টি)");return}try{var r=await aa("/api/admin/qadd",{qs:D,tags:tags()});toast(bn(r.added)+"টি সংরক্ষিত"+(r.skipped?", "+bn(r.skipped)+"টি আগেই ছিল":""));D=[];drf();qbInfo()}catch(e){toast(e.error||"ত্রুটি")}}
 async function genq(){var ss=[].slice.call(document.querySelectorAll("#gs input:checked")).map(function(x){return x.value});if(!ss.length){toast("কমপক্ষে একটি বিষয় বেছে নিন");return}
-var total=Math.max(1,Math.min(300,+$("gn").value||10)),b=$("gb"),done=0,fail=0,last="",base=Math.floor(total/ss.length),extra=total%ss.length;b.disabled=true;
+var total=Math.max(1,Math.min(300,+$("gn").value||10)),b=$("gb"),done=0,fail=0,last="",via="",base=Math.floor(total/ss.length),extra=total%ss.length;b.disabled=true;$("gxr").textContent="";
 for(var k=0;k<ss.length&&fail<4;k++){var need=base+(k<extra?1:0),sk=ss[k];
  while(need>0&&fail<4){var n=Math.min(need,8);b.textContent="এআই তৈরি করছে… "+bn(done)+"/"+bn(total)+" ("+sk+")";
   try{var avoid=D.filter(function(x){return x.s==sk}).slice(-30).map(function(x){return x.q.slice(0,50)});
    var r=await aa("/api/admin/generate",{subject:sk,style:$("gy").value,difficulty:$("gd").value,n:n,refs:$("gr").value,src:$("tg_s").value,avoid:avoid});
-   if(!r.qs.length)throw{error:"এআই ফাঁকা উত্তর দিয়েছে"};D=D.concat(r.qs);done+=r.qs.length;need-=Math.max(1,r.qs.length);drf()}catch(e){fail++;last=(e&&e.error)||"";await new Promise(function(z){setTimeout(z,2500)})}
+   if(!r.qs.length)throw{error:"এআই ফাঁকা উত্তর দিয়েছে"};D=D.concat(r.qs);done+=r.qs.length;need-=Math.max(1,r.qs.length);via=r.via||via;drf()}catch(e){fail++;last=(e&&e.error)||"";$("gxr").textContent="⚠ "+last;await new Promise(function(z){setTimeout(z,2500)})}
   await new Promise(function(z){setTimeout(z,800)})}}
-b.disabled=false;b.textContent="প্রশ্ন তৈরি করুন";toast(bn(done)+"টি প্রশ্ন খসড়ায় যোগ হলো"+(fail?" — "+bn(fail)+" বার ব্যর্থ: "+last.slice(0,100):""))}
+b.disabled=false;b.textContent="প্রশ্ন তৈরি করুন";$("gxr").textContent=(via?"✅ এআই: "+via:"")+(fail?"  ⚠ "+bn(fail)+" বার ব্যর্থ: "+last:"");toast(bn(done)+"টি প্রশ্ন খসড়ায় যোগ হলো"+(fail?" — কিছু ব্যর্থ, নিচের লেখা দেখুন":""))}
 function b64(f){return new Promise(function(res,rej){var r=new FileReader();r.onload=function(){res(String(r.result).split(",")[1])};r.onerror=rej;r.readAsDataURL(f)})}
 async function ext(){var f=$("pf").files[0];if(!f){toast("PDF বেছে নিন");return}if(f.size>11e6){toast("PDF ১০ MB-এর বেশি বড়, ভাগ করে দিন");return}var b=$("pb2"),data;b.disabled=true;b.textContent="ফাইল পড়া হচ্ছে…";
 try{data=await b64(f)}catch(x){toast("ফাইল পড়া যায়নি");b.disabled=false;return}
-var a=+$("pa").value||1,z=+$("pz").value||200,got=0,empty=0,fail=0;
+var a=+$("pa").value||1,z=+$("pz").value||200,got=0,empty=0,fail=0,last="",via="";$("exr").textContent="";
 for(var s=a;s<=z&&empty<2&&fail<3;s+=20){var e2=Math.min(s+19,z);b.textContent="বের হচ্ছে… প্রশ্ন "+bn(s)+"–"+bn(e2)+" ("+bn(got)+"টি পাওয়া গেছে)";
- try{var r=await aa("/api/admin/extract",{pdf:data,from:s,to:e2,src:$("tg_s").value,subjects:SUBJ});if(r.qs.length){empty=0;D=D.concat(r.qs);got+=r.qs.length;drf()}else empty++}catch(x){fail++}}
-b.disabled=false;b.textContent="প্রশ্ন বের করুন";toast(bn(got)+"টি প্রশ্ন পাওয়া গেছে"+(fail?" ("+bn(fail)+" বার ব্যর্থ)":""))}
+ try{var r=await aa("/api/admin/extract",{pdf:data,from:s,to:e2,src:$("tg_s").value,subjects:SUBJ});via=r.via||via;if(r.qs.length){empty=0;D=D.concat(r.qs);got+=r.qs.length;drf()}else empty++}catch(x){fail++;last=(x&&x.error)||"ত্রুটি";$("exr").textContent="⚠ "+last}}
+b.disabled=false;b.textContent="প্রশ্ন বের করুন";$("exr").textContent=(via?"✅ এআই: "+via+"  ":"")+(fail?"⚠ "+bn(fail)+" বার ব্যর্থ: "+last:"")+(!got&&!fail?"এআই কোনো প্রশ্ন খুঁজে পায়নি। PDF ঝাপসা/অস্পষ্ট হতে পারে, বা প্রশ্ন নম্বরের সীমা বদলে আবার চেষ্টা করুন।":"");toast(bn(got)+"টি প্রশ্ন পাওয়া গেছে"+(fail?" — ব্যর্থতার কারণ নিচে লেখা আছে":""))}
 function impq(){try{var a=JSON.parse($("ij").value);a=a.filter(function(x){return x&&x.q&&x.o&&x.o.length==4&&Number.isInteger(x.a)});D=D.concat(a);toast(bn(a.length)+"টি খসড়ায় যোগ হলো");drf()}catch(e){toast("JSON ঠিক নেই")}}
 function manq(){var o=[0,1,2,3].map(function(i){return $("mq_"+i).value.trim()}),q=$("mq_q").value.trim();if(!q||o.some(function(x){return!x})){toast("প্রশ্ন ও চারটি অপশন লিখুন");return}D.push({q:q,o:o,a:+$("mq_a").value,e:$("mq_e").value,s:$("mq_s").value,t:$("mq_t").value});["q","0","1","2","3","e"].forEach(function(k){$("mq_"+k).value=""});drf()}
 async function qbInfo(){var b=$("qb");if(!b)return;try{var s=await aa("/api/admin/qstats"),t=0;s.forEach(function(x){t+=x.c});
