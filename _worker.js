@@ -111,21 +111,27 @@ async function ai(env, p, pdf) {
   };
   const order = csv(env.AI_ORDER, "gemini,anthropic,openai,xai,custom").map(s => s.toLowerCase()).filter(k => P[k]);
   if (!order.length) throw new Error("কোনো এআই এপিআই কী সেট করা নেই (GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY)");
+  const NM = { gemini: "Gemini", anthropic: "Claude", openai: "ChatGPT", xai: "Grok", custom: "Custom" }, stat = {};
+  const summary = () => Object.keys(NM).map(k => NM[k] + ": " + (P[k] ? stat[k] || "চেষ্টা হয়নি" : "কী সেট নেই")).join(" | ");
   for (const k of order) {
     const pr = P[k];
-    if (pdf && pr.nopdf) { errs.push(pr.name + ": PDF সমর্থন নেই"); continue; }
+    if (pdf && pr.nopdf) { stat[k] = "PDF সমর্থন নেই"; continue; }
+    let skip = false;
     for (const model of pr.models) {
+      if (skip) break;
       for (let n = 0; n < 2; n++) {
-        if (Date.now() - t0 > 50000) { errs.push("সময় শেষ"); throw new Error("এআই এখন ব্যস্ত — " + errs.slice(-5).join(" | ")); }
+        if (Date.now() - t0 > 50000) throw new Error("এআই এখন ব্যস্ত (সময় শেষ) — " + summary());
         let res;
         try { res = await pr.call(model); } catch (e) { res = { st: 0, txt: "", msg: String(e.message || e) }; }
         if (res.txt) { env.__via = pr.name + " (" + model + ")"; return res.txt; }
-        errs.push(pr.name + ":" + model + " " + res.st + " " + String(res.msg).slice(0, 70));
-        if (res.st === 429 || res.st >= 500 || res.st === 0) await wait(1500); else break;
+        const msg = String(res.msg).replace(/\s+/g, " ").slice(0, 90);
+        stat[k] = res.st + " " + msg + " (" + model + ")";
+        if (res.st === 401 || res.st === 403 || (res.st === 429 && /credit|billing|insufficient/i.test(msg))) { skip = true; break; }
+        if ((res.st === 429 && !/quota|exhaust/i.test(msg)) || res.st >= 500 || res.st === 0) await wait(1500); else break;
       }
     }
   }
-  throw new Error("সব এআই ব্যর্থ — " + errs.slice(-5).join(" | "));
+  throw new Error("সব এআই ব্যর্থ — " + summary());
 }
 
 const HINT = {
