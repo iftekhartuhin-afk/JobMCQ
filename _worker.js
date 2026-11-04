@@ -83,16 +83,15 @@ function parseQ(txt) {
 }
 
 const hasAI = env => !!(env.GEMINI_API_KEY || env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.XAI_API_KEY || (env.CUSTOM_AI_KEY && env.CUSTOM_AI_URL));
-// একাধিক এআই: একটি ব্যস্ত/ব্যর্থ হলে পরেরটি। ক্রম: AI_ORDER (ডিফল্ট gemini,anthropic,openai,xai,custom); শুধু যেগুলোর কী সেট আছে সেগুলো চলে।
-async function ai(env, p, pdf) {
-  const errs = [], t0 = Date.now(), wait = ms => new Promise(r => setTimeout(r, ms));
-  const csv = (v, d) => String(v || d || "").split(",").map(s => s.trim()).filter(Boolean);
+const NM = { gemini: "Gemini", anthropic: "Claude", openai: "ChatGPT", xai: "Grok", custom: "Custom" };
+const csv = (v, d) => String(v || d || "").split(",").map(s => s.trim()).filter(Boolean);
+function buildP(env, p, pdf) {
   const oai = (url, key) => async model => {
     const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + key }, body: JSON.stringify({ model, temperature: 0.7, messages: [{ role: "user", content: pdf ? [{ type: "file", file: { filename: "q.pdf", file_data: "data:application/pdf;base64," + pdf } }, { type: "text", text: p }] : p }] }) });
     const j = await r.json().catch(() => ({})), m = j.choices && j.choices[0] && j.choices[0].message;
     return { st: r.status, txt: m && m.content, msg: (j.error && (j.error.message || j.error)) || "" };
   };
-  const P = {
+  return {
     gemini: env.GEMINI_API_KEY && { name: "Gemini", models: csv(env.GEMINI_MODELS || env.GEMINI_MODEL, "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash"), call: async model => {
       const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", { method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
         body: JSON.stringify({ contents: [{ parts: (pdf ? [{ inline_data: { mime_type: "application/pdf", data: pdf } }] : []).concat([{ text: p }]) }], generationConfig: { responseMimeType: "application/json", temperature: 0.8 } }) });
@@ -109,9 +108,13 @@ async function ai(env, p, pdf) {
     xai: env.XAI_API_KEY && { name: "Grok", nopdf: 1, models: csv(env.XAI_MODELS, "grok-3-mini,grok-3"), call: oai("https://api.x.ai/v1/chat/completions", env.XAI_API_KEY) },
     custom: env.CUSTOM_AI_KEY && env.CUSTOM_AI_URL && { name: "Custom", nopdf: 1, models: csv(env.CUSTOM_AI_MODELS), call: oai(env.CUSTOM_AI_URL, env.CUSTOM_AI_KEY) }
   };
+}
+const BILL = /credit|billing|balance|insufficient|payment|plans/i;
+// একাধিক এআই: একটি ব্যস্ত/ব্যর্থ হলে পরেরটি। ক্রম: AI_ORDER (ডিফল্ট gemini,anthropic,openai,xai,custom); শুধু যেগুলোর কী সেট আছে সেগুলো চলে।
+async function ai(env, p, pdf) {
+  const t0 = Date.now(), wait = ms => new Promise(r => setTimeout(r, ms)), P = buildP(env, p, pdf), stat = {};
   const order = csv(env.AI_ORDER, "gemini,anthropic,openai,xai,custom").map(s => s.toLowerCase()).filter(k => P[k]);
   if (!order.length) throw new Error("কোনো এআই এপিআই কী সেট করা নেই (GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY)");
-  const NM = { gemini: "Gemini", anthropic: "Claude", openai: "ChatGPT", xai: "Grok", custom: "Custom" }, stat = {};
   const summary = () => Object.keys(NM).map(k => NM[k] + ": " + (P[k] ? stat[k] || "চেষ্টা হয়নি" : "কী সেট নেই")).join(" | ");
   for (const k of order) {
     const pr = P[k];
@@ -126,12 +129,27 @@ async function ai(env, p, pdf) {
         if (res.txt) { env.__via = pr.name + " (" + model + ")"; return res.txt; }
         const msg = String(res.msg).replace(/\s+/g, " ").slice(0, 90);
         stat[k] = res.st + " " + msg + " (" + model + ")";
-        if (res.st === 401 || res.st === 403 || (res.st === 429 && /credit|billing|insufficient/i.test(msg))) { skip = true; break; }
+        if (res.st === 401 || res.st === 402 || res.st === 403 || ([400, 429].includes(res.st) && BILL.test(msg))) { skip = true; break; }
         if ((res.st === 429 && !/quota|exhaust/i.test(msg)) || res.st >= 500 || res.st === 0) await wait(1500); else break;
       }
     }
   }
   throw new Error("সব এআই ব্যর্থ — " + summary());
+}
+async function aiProbe(env) {
+  const P = buildP(env, 'আউটপুট শুধু এই JSON: ["ok"]', null), out = [];
+  for (const k of Object.keys(NM)) {
+    const pr = P[k];
+    if (!pr) { out.push({ name: NM[k], ok: 0, msg: "কী সেট নেই" }); continue; }
+    let best = null;
+    for (const m of pr.models) {
+      let res; try { res = await pr.call(m); } catch (e) { res = { st: 0, txt: "", msg: String(e.message || e) }; }
+      if (res.txt) { best = { name: pr.name, ok: 1, model: m }; break; }
+      best = { name: pr.name, ok: 0, model: m, msg: res.st + " " + String(res.msg).replace(/\s+/g, " ").slice(0, 110) };
+    }
+    out.push(best || { name: pr.name, ok: 0, msg: "কোনো মডেল দেওয়া নেই" });
+  }
+  return out;
 }
 
 const HINT = {
@@ -381,6 +399,7 @@ async function admApi(env, p, B, Q, now) {
     else if (B.s != null && B.n) await env.DB.prepare("UPDATE qbank SET free=1 WHERE id IN (SELECT id FROM qbank WHERE s=? AND free=0 ORDER BY RANDOM() LIMIT ?)").bind(B.s, Math.min(500, +B.n)).run();
     return J({ ok: 1 });
   }
+  if (p === "/api/admin/aitest") return J(await aiProbe(env));
   if (p === "/api/admin/generate") {
     if (!hasAI(env)) return J({ error: "কোনো এআই এপিআই কী সেট করা নেই" }, 400);
     const qs = await gen(env, B);
@@ -672,8 +691,8 @@ function b64(f){return new Promise(function(res,rej){var r=new FileReader();r.on
 async function ext(){var f=$("pf").files[0];if(!f){toast("PDF বেছে নিন");return}if(f.size>11e6){toast("PDF ১০ MB-এর বেশি বড়, ভাগ করে দিন");return}var b=$("pb2"),data;b.disabled=true;b.textContent="ফাইল পড়া হচ্ছে…";
 try{data=await b64(f)}catch(x){toast("ফাইল পড়া যায়নি");b.disabled=false;return}
 var a=+$("pa").value||1,z=+$("pz").value||200,got=0,empty=0,fail=0,last="",via="";$("exr").textContent="";
-for(var s=a;s<=z&&empty<2&&fail<3;s+=20){var e2=Math.min(s+19,z);b.textContent="বের হচ্ছে… প্রশ্ন "+bn(s)+"–"+bn(e2)+" ("+bn(got)+"টি পাওয়া গেছে)";
- try{var r=await aa("/api/admin/extract",{pdf:data,from:s,to:e2,src:$("tg_s").value,subjects:SUBJ});via=r.via||via;if(r.qs.length){empty=0;D=D.concat(r.qs);got+=r.qs.length;drf()}else empty++}catch(x){fail++;last=(x&&x.error)||"ত্রুটি";$("exr").textContent="⚠ "+last}}
+for(var s=a;s<=z&&empty<2&&fail<3;s+=30){var e2=Math.min(s+29,z);b.textContent="বের হচ্ছে… প্রশ্ন "+bn(s)+"–"+bn(e2)+" ("+bn(got)+"টি পাওয়া গেছে)";
+ try{var r=await aa("/api/admin/extract",{pdf:data,from:s,to:e2,src:$("tg_s").value,subjects:SUBJ});via=r.via||via;if(r.qs.length){empty=0;D=D.concat(r.qs);got+=r.qs.length;drf();if(r.qs.length<10)empty=2}else empty++}catch(x){fail++;last=(x&&x.error)||"ত্রুটি";$("exr").textContent="⚠ "+last;if(/credit|billing|quota|balance/i.test(last))break}await new Promise(function(z){setTimeout(z,1200)})}
 b.disabled=false;b.textContent="প্রশ্ন বের করুন";$("exr").textContent=(via?"✅ এআই: "+via+"  ":"")+(fail?"⚠ "+bn(fail)+" বার ব্যর্থ: "+last:"")+(!got&&!fail?"এআই কোনো প্রশ্ন খুঁজে পায়নি। PDF ঝাপসা/অস্পষ্ট হতে পারে, বা প্রশ্ন নম্বরের সীমা বদলে আবার চেষ্টা করুন।":"");toast(bn(got)+"টি প্রশ্ন পাওয়া গেছে"+(fail?" — ব্যর্থতার কারণ নিচে লেখা আছে":""))}
 function impq(){try{var a=JSON.parse($("ij").value);a=a.filter(function(x){return x&&x.q&&x.o&&x.o.length==4&&Number.isInteger(x.a)});D=D.concat(a);toast(bn(a.length)+"টি খসড়ায় যোগ হলো");drf()}catch(e){toast("JSON ঠিক নেই")}}
 function manq(){var o=[0,1,2,3].map(function(i){return $("mq_"+i).value.trim()}),q=$("mq_q").value.trim();if(!q||o.some(function(x){return!x})){toast("প্রশ্ন ও চারটি অপশন লিখুন");return}D.push({q:q,o:o,a:+$("mq_a").value,e:$("mq_e").value,s:$("mq_s").value,t:$("mq_t").value});["q","0","1","2","3","e"].forEach(function(k){$("mq_"+k).value=""});drf()}
@@ -700,7 +719,8 @@ async function grant(rv){try{await aa("/api/admin/grant",{email:$("ge").value,da
 async function adUsers(){var a=$("ad");a.innerHTML='<div class="card"><input id="us" placeholder="নাম বা ইমেইল দিয়ে খুঁজুন" oninput="usl()"></div><div id="ul"></div>';usl()}
 var ut=null;function usl(){clearTimeout(ut);ut=setTimeout(async function(){var r=await aa("/api/admin/users?search="+encodeURIComponent($("us").value));$("ul").innerHTML='<div class="card sc"><table class="t"><tr><th>নাম</th><th>ইমেইল</th><th>লক্ষ্য</th><th>পয়েন্ট</th><th>পাস</th></tr>'+r.map(function(x){return'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.email)+'</td><td>'+esc(x.body||"-")+'</td><td>'+bn(x.pts)+'</td><td>'+(x.prem>Date.now()?"✅":"-")+'</td></tr>'}).join("")+'</table></div>'},250)}
 async function adSet(){var s=await aa("/api/admin/settings",{}),F=[["price","পাসের দাম (টাকা)"],["days","পাসের মেয়াদ (দিন, ৩৬৫০০ = আজীবন)"],["ticker","উপরের নিউজ-স্ট্রিপের লেখা"],["tickerBadge","স্ট্রিপের ব্যাজ (যেমন: নতুন, ৭৫৩ পদ)"],["notice","হোম পেজের নোটিশ"],["examName","আনুমানিক পরীক্ষার নাম"],["examDate","আনুমানিক পরীক্ষার তারিখ (YYYY-MM-DD)"],["bkash","বিকাশ নম্বর"],["nagad","নগদ নম্বর"],["rocket","রকেট নম্বর"],["wa","হোয়াটসঅ্যাপ নম্বর (দেশের কোডসহ, যেমন 8801XXXXXXXXX)"]];
-$("ad").innerHTML='<div class="card"><h2>সাইট সেটিংস</h2>'+F.map(function(f){return'<label>'+f[1]+'</label><input id="st_'+f[0]+'" value="'+esc(s[f[0]])+'">'}).join("")+'<button class="btn wide" onclick="saveSet()">সংরক্ষণ করুন</button></div>';window._F=F}
+$("ad").innerHTML='<div class="card"><h2>সাইট সেটিংস</h2>'+F.map(function(f){return'<label>'+f[1]+'</label><input id="st_'+f[0]+'" value="'+esc(s[f[0]])+'">'}).join("")+'<button class="btn wide" onclick="saveSet()">সংরক্ষণ করুন</button></div><div class="card"><h2>এআই সংযোগ পরীক্ষা</h2><div class="m">কোন এআই-এর কী সেট আছে ও কোনটা এখন কাজ করছে (কিছু কোটা খরচ হবে না, খুব ছোট অনুরোধ)।</div><button class="btn wide" id="atb" onclick="aiTest()">এআই পরীক্ষা করুন</button><div id="atr" style="margin-top:10px"></div></div>';window._F=F}
+async function aiTest(){var b=$("atb");b.disabled=true;b.textContent="পরীক্ষা চলছে…";try{var r=await aa("/api/admin/aitest",{});$("atr").innerHTML=r.map(function(x){return'<div class="card" style="box-shadow:none;margin:6px 0"><b>'+(x.ok?"✅ ":"❌ ")+esc(x.name)+'</b>'+(x.ok?' <span class="pill fr">'+esc(x.model)+' কাজ করছে</span>':'<div class="m">'+esc(x.msg||"")+(x.model?" ("+esc(x.model)+")":"")+"</div>")+"</div>"}).join("")}catch(e){$("atr").textContent=e.error||"ত্রুটি"}b.disabled=false;b.textContent="এআই পরীক্ষা করুন"}
 async function saveSet(){var o={};window._F.forEach(function(f){o[f[0]]=$("st_"+f[0]).value});try{await aa("/api/admin/settings",{set:o});toast("সংরক্ষিত হয়েছে")}catch(e){toast(e.error||"ত্রুটি")}}
 boot();
 </script></body></html>
